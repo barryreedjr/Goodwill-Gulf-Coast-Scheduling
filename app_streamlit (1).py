@@ -1,0 +1,284 @@
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import io
+
+st.set_page_config(page_title="Goodwill Scheduler", layout="wide")
+st.title("Goodwill Gulf Coast — Weekly Scheduler")
+st.caption("Upload the input Excel, choose an optional start date, and download a 4-week schedule.")
+
+# --- Utility loaders and helpers ---
+def load_inputs(file):
+    xls = pd.ExcelFile(file)
+    employees = pd.read_excel(xls, "employees").fillna("")
+    availability = pd.read_excel(xls, "availability").fillna("")
+    coverage = pd.read_excel(xls, "coverage_template").fillna("")
+    anchors = pd.read_excel(xls, "shift_anchors").fillna("")
+    rules = pd.read_excel(xls, "rules")
+    for df in [availability, coverage]:
+        df["Day"] = df["Day"].str.strip().str.title()
+    return employees, availability, coverage, anchors, rules
+
+def build_availability_map(availability):
+    avail = {}
+    for _, row in availability.iterrows():
+        emp = row["Employee"]; day = row["Day"]
+        start = row["Start"]; end = row["End"]
+        avail.setdefault(emp, {}).setdefault(day, []).append((start, end))
+    return avail
+
+def employee_functions_map(employees):
+    m = {}
+    for _, r in employees.iterrows():
+        funcs = [f.strip() for f in str(r["Functions"]).split(",") if str(f).strip()]
+        m[r["Employee"]] = set(funcs)
+    return m
+
+DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
+
+def weekend_rotation(employees):
+    emps = list(employees["Employee"])
+    groups = {i:set() for i in range(4)}
+    for i, e in enumerate(emps):
+        groups[i % 4].add(e)
+    return groups
+
+def generate_week_dates(start_date):
+    # Align to Sunday
+    start = start_date - timedelta(days=start_date.weekday()+1 if start_date.weekday()!=6 else 0)
+    return [[start + timedelta(days=7*w + i) for i in range(7)] for w in range(4)]
+
+def anchored_shift_window(shift_type, hours, anchors_map):
+    a = anchors_map[shift_type]
+    if a["Anchor"] == "Start":
+        st = datetime.strptime(a["Time"], "%H:%M")
+        en = st + timedelta(hours=float(hours))
+        return (a["Time"], en.strftime("%H:%M"))
+    else:
+        en = datetime.strptime(a["Time"], "%H:%M")
+        st = en - timedelta(hours=float(hours))
+        return (st.strftime("%H:%M"), a["Time"])
+
+def can_assign(emp, role, day_name, start_str, end_str, avail_map, funcs_map, assigned, rules, assigned_hours, days_worked, min_hours_map):
+    if role not in funcs_map.get(emp, set()): return False
+    windows = avail_map.get(emp, {}).get(day_name, [])
+    if not any(a_start <= start_str and a_end >= end_str for a_start, a_end in windows): return False
+    # overlap + gap
+    min_gap = float(rules.get("MinGapBetweenShiftsHours", 1))
+    def to_dt_local(t): return datetime.combine(datetime.today(), datetime.strptime(t, "%H:%M").time())
+    slot_s, slot_e = to_dt_local(start_str), to_dt_local(end_str)
+    for a in assigned:
+        if a["Employee"]!=emp or a["Day"]!=day_name: continue
+        s, e = to_dt_local(a["Start"]), to_dt_local(a["End"])
+        if not (slot_e <= s or slot_s >= e): return False
+        if 0 <= (s - slot_e).total_seconds()/3600 < min_gap or 0 <= (slot_s - e).total_seconds()/3600 < min_gap: return False
+    if len(days_worked.get(emp, set())) >= int(rules.get("MaxDaysPerWeek", 6)) and day_name not in days_worked.get(emp,set()): return False
+    return True
+
+def run_schedule(file, startdate_str=None, role_colors=None):
+    employees, availability, coverage, anchors, rules_df = load_inputs(file)
+    rules = dict(zip(rules_df["Rule"], rules_df["Value"]))
+    rules["MinShiftHours"] = float(rules.get("MinShiftHours", 6))
+    rules["MaxShiftHours"] = float(rules.get("MaxShiftHours", 8))
+    rules["MinGapBetweenShiftsHours"] = float(rules.get("MinGapBetweenShiftsHours", 1))
+    rules["MaxDaysPerWeek"] = int(rules.get("MaxDaysPerWeek", 6))
+    anchors_map = {r["ShiftType"]: {"Anchor": r["Anchor"], "Time": r["Time"]} for _, r in anchors.iterrows()}
+    pref_hours = dict(zip(employees["Employee"], employees.get("PreferredShiftHours", pd.Series([rules["MaxShiftHours"]]*len(employees))).fillna(rules["MaxShiftHours"])))
+    funcs_map = employee_functions_map(employees)
+    avail_map = build_availability_map(availability)
+    min_hours_map = dict(zip(employees["Employee"], employees["MinHours"]))
+    # start date
+    if startdate_str:
+        startdate = datetime.strptime(startdate_str, "%Y-%m-%d").date()
+    else:
+        today = datetime.today().date()
+        delta = (6 - today.weekday()) % 7
+        startdate = today + timedelta(days=delta)
+    weeks = generate_week_dates(startdate)
+    weekend_groups = weekend_rotation(employees)
+    assignments = []
+    for w_idx, week_dates in enumerate(weeks):
+        off_group = weekend_groups[w_idx]
+        local_avail = {e:{d:list(w) for d,w in days.items()} for e,days in avail_map.items()}
+        for e in off_group:
+            for d in ["Saturday","Sunday"]:
+                if e in local_avail and d in local_avail[e]:
+                    local_avail[e][d] = []
+        assigned_hours = {e:0 for e in employees["Employee"]}
+        days_worked = {e:set() for e in employees["Employee"]}
+        for d_idx, date in enumerate(week_dates):
+            day_name = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][d_idx]
+            day_cov = coverage[coverage["Day"]==day_name].copy()
+            rarity = {}
+            for role in day_cov["Role"].unique():
+                count = sum(1 for e in employees["Employee"] if role in funcs_map.get(e,set()))
+                rarity[role] = 1.0/(count if count>0 else 0.5)
+            day_cov["rarity"] = day_cov["Role"].map(lambda r: rarity.get(r,1.0))
+            day_cov = day_cov.sort_values("rarity", ascending=False)
+            demands = []
+            for _, r in day_cov.iterrows():
+                demands += [{"Role": r["Role"], "ShiftType": r["ShiftType"]} for _ in range(int(r["Count"]))]
+            for dem in demands:
+                role, stype = dem["Role"], dem["ShiftType"]
+                candidates = []
+                for e in employees["Employee"]:
+                    if role not in funcs_map.get(e,set()): continue
+                    hours = float(pref_hours.get(e, rules["MaxShiftHours"]))
+                    hours = min(max(hours, rules["MinShiftHours"]), rules["MaxShiftHours"])
+                    s_str, e_str = anchored_shift_window(stype, hours, anchors_map)
+                    if not can_assign(e, role, day_name, s_str, e_str, local_avail, funcs_map, assignments, rules, assigned_hours, days_worked, min_hours_map):
+                        continue
+                    under_min = 1 if assigned_hours[e] < min_hours_map.get(e,0) else 0
+                    candidates.append((under_min, -assigned_hours[e], -len(days_worked[e]), e, s_str, e_str, role))
+                if not candidates:
+                    assignments.append({"Week": w_idx+1, "Date": date.strftime("%Y-%m-%d"), "Day": day_name, "Employee": "UNFILLED", "Start": "", "End": "", "Role": role})
+                    continue
+                candidates.sort(reverse=True)
+                _,_,_, e, s_str, e_str, role = candidates[0]
+                assignments.append({"Week": w_idx+1, "Date": date.strftime("%Y-%m-%d"), "Day": day_name, "Employee": e, "Start": s_str, "End": e_str, "Role": role})
+                sh = (datetime.strptime(e_str, "%H:%M") - datetime.strptime(s_str, "%H:%M")).seconds/3600
+                assigned_hours[e] += sh
+                days_worked[e].add(day_name)
+    out = pd.DataFrame(assignments)
+
+    # Build separate sheets with color-by-role and print setup
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        header_fmt = workbook.add_format({"bold": True, "align":"center", "valign":"vcenter", "border":1})
+        name_fmt = workbook.add_format({"bold": True, "align":"left", "valign":"vcenter", "border":1})
+        cell_fmt = workbook.add_format({"text_wrap": True, "align":"left", "valign":"top", "border":1})
+        off_fmt = workbook.add_format({"align":"center", "valign":"vcenter", "border":1, "font_color":"#666666"})
+        # role colors
+        default_role_colors = {"Cashier":"#E3F2FD","Donation":"#E8F5E9","Pricer":"#FFF3E0","Hanger":"#F3E5F5","Manager":"#FFEBEE"}
+        role_colors = role_colors or default_role_colors
+        role_formats = {role: workbook.add_format({"text_wrap": True, "align":"left", "valign":"top", "border":1, "bg_color": color})
+                        for role, color in role_colors.items()}
+        # detailed tab
+        out.to_excel(writer, index=False, sheet_name="assignments_detailed")
+        for wk in range(1,5):
+            wkdf = out[out["Week"]==wk].copy()
+            if wkdf.empty: continue
+            start_date = wkdf["Date"].min(); end_date = wkdf["Date"].max()
+            title = f"Week {wk} ({start_date} to {end_date})"
+            emps = sorted(wkdf["Employee"].unique())
+            emps = [e for e in emps if e!="UNFILLED"]
+            frame = pd.DataFrame({"Employee": emps})
+            for d in DAYS: frame[d] = ""
+            for e in emps:
+                for d in DAYS:
+                    rows = wkdf[(wkdf["Employee"]==e) & (wkdf["Day"]==d)]
+                    if len(rows)==0:
+                        frame.loc[frame["Employee"]==e, d] = ("OFF", None); continue
+                    parts = []; first_role = None
+                    for _, r in rows.iterrows():
+                        st = datetime.strptime(r["Start"], "%H:%M").strftime("%-I:%M %p")
+                        en = datetime.strptime(r["End"], "%H:%M").strftime("%-I:%M %p")
+                        parts.append(f"{st}-{en} {r['Role']}")
+                        if first_role is None: first_role = r["Role"]
+                    frame.loc[frame["Employee"]==e, d] = ("\n".join(parts), first_role)
+            sheetname = f"Week {wk}"
+            frame_out = frame.copy()
+            for d in DAYS:
+                frame_out[d] = frame_out[d].apply(lambda x: x[0] if isinstance(x, tuple) else x)
+            frame_out.to_excel(writer, index=False, sheet_name=sheetname, startrow=1)
+            ws = writer.sheets[sheetname]
+            ws.merge_range(0,0,0,8, title, header_fmt)
+            ws.set_column(0,0,24); ws.set_column(1,7,22)
+            for col_idx, d in enumerate(DAYS, start=1):
+                drows = wkdf[wkdf["Day"]==d]
+                if not drows.empty:
+                    dt = pd.to_datetime(drows["Date"].iloc[0]).date().strftime("%m/%d")
+                    label = f"{d} {dt}"
+                else:
+                    label = d
+                ws.write(1, col_idx, label, header_fmt)
+            ws.write(1, 0, "Employee", header_fmt)
+            # Print setup
+            ws.set_landscape(); ws.fit_to_pages(1, 0); ws.repeat_rows(1, 1); ws.center_horizontally()
+            for r in range(2, 2 + len(frame)):
+                ws.write(r, 0, frame.iloc[r-2]["Employee"], name_fmt)
+                for c, d in enumerate(DAYS, start=1):
+                    val = frame.iloc[r-2][d]
+                    if isinstance(val, tuple):
+                        text, role = val
+                        fmt = role_formats.get(role, cell_fmt) if text != "OFF" else off_fmt
+                        ws.write(r, c, text.replace("\n","\n"), fmt)
+                    else:
+                        ws.write(r, c, "OFF", off_fmt)
+
+    output.seek(0)
+    return output
+
+# --- Template download (robust) ---
+def generate_template_bytes():
+    # Build a default template in-memory so the app never crashes if a file is missing
+    employees_df = pd.DataFrame({
+        "Employee": ["Ava Smith", "Ben King"],
+        "MaxHours": [35, 30],
+        "MinHours": [15, 15],
+        "Functions": ["Cashier,Floors", "Donations,Cashier"],
+        "PreferredShiftHours": [8, 6],
+    })
+    days = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
+    availability_rows = []
+    for emp in employees_df["Employee"]:
+        for d in days:
+            availability_rows.append({"Employee": emp, "Day": d, "Start": "08:00", "End": "20:30"})
+    availability_df = pd.DataFrame(availability_rows)
+    def v(*vals): return list(vals)
+    def add(role, counts_open, counts_mid, counts_close):
+        rows = []
+        for i, d in enumerate(days):
+            if counts_open[i] > 0:
+                rows.append({"Role": role, "Day": d, "ShiftType": "Open", "Count": counts_open[i]})
+            if counts_mid[i] > 0:
+                rows.append({"Role": role, "Day": d, "ShiftType": "Mid", "Count": counts_mid[i]})
+            if counts_close[i] > 0:
+                rows.append({"Role": role, "Day": d, "ShiftType": "Close", "Count": counts_close[i]})
+        return rows
+    coverage_rows = []
+    coverage_rows += add("Cashier", v(1,1,1,1,1,1,1), v(0,1,1,1,1,1,1), v(1,1,1,1,1,1,1))
+    coverage_rows += add("Donation", v(1,1,1,1,1,1,1), v(1,1,1,1,1,1,1), v(1,1,1,1,1,1,1))
+    coverage_df = pd.DataFrame(coverage_rows)
+    anchors_df = pd.DataFrame({"ShiftType":["Open","Mid","Close"],"Anchor":["Start","Start","End"],"Time":["08:00","10:00","20:30"]})
+    rules_df = pd.DataFrame({"Rule":["MinShiftHours","MaxShiftHours","MinGapBetweenShiftsHours","MaxDaysPerWeek","AllowSplitShifts"],
+                             "Value":[6,8,1,6,"No"]})
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+        employees_df.to_excel(writer, index=False, sheet_name="employees")
+        availability_df.to_excel(writer, index=False, sheet_name="availability")
+        coverage_df.to_excel(writer, index=False, sheet_name="coverage_template")
+        anchors_df.to_excel(writer, index=False, sheet_name="shift_anchors")
+        rules_df.to_excel(writer, index=False, sheet_name="rules")
+    bio.seek(0)
+    return bio.read()
+
+# Sidebar: robust template button (generate if missing)
+st.sidebar.header("Template")
+try:
+    with open("schedule_input_template_v2.xlsx", "rb") as f:
+        template_bytes = f.read()
+except FileNotFoundError:
+    template_bytes = generate_template_bytes()
+st.sidebar.download_button(
+    label="Download blank template",
+    data=template_bytes,
+    file_name="schedule_input_template_v2.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+# Upload + run
+uploaded = st.file_uploader("Upload schedule_input_template_v2.xlsx", type=["xlsx"])
+startdate = st.text_input("Start date (YYYY-MM-DD, optional; defaults to upcoming Sunday)", "")
+if st.button("Generate 4-week schedule", type="primary"):
+    if not uploaded:
+        st.error("Please upload the input Excel first.")
+    else:
+        try:
+            schedule_file = run_schedule(uploaded, startdate.strip() or None)
+            st.success("Schedule generated!")
+            st.download_button("Download schedule_output_calendar_weeks.xlsx", data=schedule_file, file_name="schedule_output_calendar_weeks.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.exception(e)
