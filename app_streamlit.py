@@ -4,10 +4,11 @@ from datetime import datetime, timedelta, date
 import io
 
 st.set_page_config(page_title="Goodwill Scheduler", layout="wide")
-st.title("Goodwill Gulf Coast — Weekly Scheduler (weekly hour caps)")
+st.title("Goodwill Gulf Coast — Weekly Scheduler (weekly caps, lunch, night rotation, Paycom export)")
 st.caption(
     "Upload the input Excel, choose an optional start date, and download a 4-week schedule. "
-    "This build enforces MaxHours per week and adds an Hours Summary tab to verify."
+    "Weekly max hours are enforced per week, long shifts add lunch automatically, "
+    "night shifts are spread (priority), and a Paycom import template is generated."
 )
 
 DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
@@ -22,6 +23,16 @@ def fmt_time(hhmm: str) -> str:
         return s.lstrip("0")
     except Exception:
         return hhmm
+
+
+def hhmm_to_4dig(hhmm: str) -> str:
+    # "HH:MM" -> "HHMM" (always 4 digits)
+    try:
+        t = datetime.strptime(hhmm, "%H:%M")
+        return t.strftime("%H%M")
+    except Exception:
+        # best effort fallback
+        return hhmm.replace(":", "")[:4].rjust(4, "0")
 
 
 def get_numeric_series(df: pd.DataFrame, col: str, default_val, length: int) -> pd.Series:
@@ -146,22 +157,52 @@ def generate_week_dates(start_date: date):
     return [[start + timedelta(days=7 * w + i) for i in range(7)] for w in range(4)]
 
 
-def anchored_shift_window(shift_type, hours, anchors_map):
+# ------------------ Lunch & Night Rules ------------------
+def is_night_shift(stype: str, end_time_str: str, night_types: set, night_end_threshold: str | None):
+    if stype in night_types:
+        return True
+    if night_end_threshold:
+        try:
+            end_dt = datetime.strptime(end_time_str, "%H:%M").time()
+            thr_dt = datetime.strptime(night_end_threshold, "%H:%M").time()
+            return end_dt >= thr_dt
+        except Exception:
+            return False
+    return False
+
+
+def compute_lunch_pad(paid_hours: float, trigger_hours: float, lunch_minutes: int) -> float:
+    """Return lunch padding hours to add to the scheduled block (not paid hours)."""
+    if paid_hours > trigger_hours:
+        return lunch_minutes / 60.0
+    return 0.0
+
+
+def anchored_shift_window(shift_type, paid_hours, anchors_map, rules) -> tuple[str, str, float]:
+    """
+    Return (start_str, end_str, lunch_pad_hours).
+    If lunch is required, expand the scheduled block by lunch_pad_hours while keeping paid_hours as-is.
+    """
     a = anchors_map[shift_type]
+    trigger = float(rules.get("LunchTriggerHours", 5))
+    lunch_minutes = int(rules.get("LunchMinutes", 30))
+    lunch_pad = compute_lunch_pad(float(paid_hours), trigger, lunch_minutes)
+
     if a["Anchor"] == "Start":
         stt = datetime.strptime(a["Time"], "%H:%M")
-        en = stt + timedelta(hours=float(hours))
-        return (a["Time"], en.strftime("%H:%M"))
+        en = stt + timedelta(hours=float(paid_hours) + lunch_pad)
+        return (a["Time"], en.strftime("%H:%M"), lunch_pad)
     else:
         en = datetime.strptime(a["Time"], "%H:%M")
-        stt = en - timedelta(hours=float(hours))
-        return (stt.strftime("%H:%M"), a["Time"])
+        stt = en - timedelta(hours=float(paid_hours) + lunch_pad)
+        return (stt.strftime("%H:%M"), a["Time"], lunch_pad)
 
 
-def hours_between(start_str, end_str):
+def scheduled_hours_between(start_str, end_str):
     return (datetime.strptime(end_str, "%H:%M") - datetime.strptime(start_str, "%H:%M")).seconds / 3600
 
 
+# ------------------ Constraints ------------------
 def can_assign(
     emp,
     role,
@@ -172,10 +213,10 @@ def can_assign(
     funcs_map,
     assigned_list_for_week,
     rules,
-    assigned_hours_week,
+    assigned_paid_hours_week,
     days_worked_week,
     min_hours_map,
-    weekly_max_hours_map,
+    weekly_max_paid_hours_map,
 ):
     if role not in funcs_map.get(emp, set()):
         return False
@@ -200,9 +241,9 @@ def can_assign(
         if 0 <= (s - slot_e).total_seconds() / 3600 < min_gap or 0 <= (slot_s - e).total_seconds() / 3600 < min_gap:
             return False
 
-    # Weekly max hours constraint
-    sh = hours_between(start_str, end_str)
-    if assigned_hours_week.get(emp, 0) + sh > weekly_max_hours_map.get(emp, float("inf")):
+    # Weekly max *paid* hours constraint
+    paid_hours = float(rules.get("_candidate_paid_hours", 0))
+    if assigned_paid_hours_week.get(emp, 0) + paid_hours > weekly_max_paid_hours_map.get(emp, float("inf")):
         return False
 
     if len(days_worked_week.get(emp, set())) >= int(rules.get("MaxDaysPerWeek", 6)) and day_name not in days_worked_week.get(emp, set()):
@@ -213,22 +254,46 @@ def can_assign(
 
 # ------------------ Scheduler ------------------
 def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
-    # Wrapper that returns (excel_bytes, out_df, hours_pivot_df)
+    # Load
     employees, availability, availability_simple, coverage, anchors, rules_df = load_inputs(file)
     rules = dict(zip(rules_df["Rule"], rules_df["Value"]))
+
+    # Defaults / new knobs
     rules["MinShiftHours"] = float(rules.get("MinShiftHours", 3))
     rules["MaxShiftHours"] = float(rules.get("MaxShiftHours", 10))
     rules["MinGapBetweenShiftsHours"] = float(rules.get("MinGapBetweenShiftsHours", 1))
     rules["MaxDaysPerWeek"] = int(rules.get("MaxDaysPerWeek", 6))
+    # Lunch config
+    rules["LunchTriggerHours"] = float(rules.get("LunchTriggerHours", 5))
+    rules["LunchMinutes"] = int(rules.get("LunchMinutes", 30))
+    # Night shift config
+    night_types = set([s.strip() for s in str(rules.get("NightShiftTypes", "Close")).split(",") if s.strip()])
+    night_end_threshold = str(rules.get("NightShiftEndAtOrAfter", "")).strip() or None
+
     anchors_map = {r["ShiftType"]: {"Anchor": r["Anchor"], "Time": r["Time"]} for _, r in anchors.iterrows()}
 
+    # Weekly max (paid) hours column
     weekly_max_series = get_numeric_series(
         employees,
         "MaxHoursPerWeek" if "MaxHoursPerWeek" in employees.columns else "MaxHours",
         999,
         len(employees),
     )
-    weekly_max_hours_map = dict(zip(employees["Employee"], weekly_max_series))
+    weekly_max_paid_hours_map = dict(zip(employees["Employee"], weekly_max_series))
+
+    # Employee ID map (supports 'EmployeeID' or 'Employee ID')
+    emp_id_col = None
+    for cand in ["EmployeeID", "Employee ID"]:
+        if cand in employees.columns:
+            emp_id_col = cand
+            break
+    if emp_id_col:
+        emp_id_map = dict(zip(
+            employees["Employee"],
+            employees[emp_id_col].astype(str).str.strip()
+        ))
+    else:
+        emp_id_map = {e: "" for e in employees["Employee"]}
 
     pref_hours = dict(
         zip(
@@ -256,8 +321,10 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
     assignments_all = []
 
     for w_idx, week_dates in enumerate(weeks):
-        assigned_hours_week = {e: 0 for e in employees["Employee"]}
+        # tracking per week
+        assigned_paid_hours_week = {e: 0.0 for e in employees["Employee"]}
         days_worked_week = {e: set() for e in employees["Employee"]}
+        nights_worked_week = {e: 0 for e in employees["Employee"]}
         assignments_this_week = []
 
         # rotating Sat/Sun off-group
@@ -291,12 +358,20 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
             for dem in demands:
                 role, stype = dem["Role"], dem["ShiftType"]
                 candidates = []
+
                 for e in employees["Employee"]:
                     if role not in funcs_map.get(e, set()):
                         continue
-                    hours = float(pref_hours.get(e, rules["MaxShiftHours"]))
-                    hours = min(max(hours, rules["MinShiftHours"]), rules["MaxShiftHours"])
-                    s_str, e_str = anchored_shift_window(stype, hours, anchors_map)
+
+                    paid_hours = float(pref_hours.get(e, rules["MaxShiftHours"]))
+                    paid_hours = min(max(paid_hours, rules["MinShiftHours"]), rules["MaxShiftHours"])
+
+                    # Build window with lunch pad
+                    s_str, e_str, lunch_pad = anchored_shift_window(stype, paid_hours, anchors_map, rules)
+
+                    # Mark candidate paid hours for cap check inside can_assign()
+                    rules["_candidate_paid_hours"] = paid_hours
+
                     if not can_assign(
                         e,
                         role,
@@ -307,15 +382,24 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
                         funcs_map,
                         assignments_this_week,
                         rules,
-                        assigned_hours_week,
+                        assigned_paid_hours_week,
                         days_worked_week,
                         min_hours_map,
-                        weekly_max_hours_map,
+                        weekly_max_paid_hours_map,
                     ):
                         continue
-                    # prefer under weekly MinHours, then fewer hours, then fewer days
-                    under_min = 1 if assigned_hours_week[e] < min_hours_map.get(e, 0) else 0
-                    candidates.append((under_min, -assigned_hours_week[e], -len(days_worked_week[e]), e, s_str, e_str, role))
+
+                    night_flag = is_night_shift(stype, e_str, night_types, night_end_threshold)
+
+                    # Priority: ensure each employee gets >=1 night per week when possible
+                    needs_night = 1 if (night_flag and nights_worked_week[e] == 0) else 0
+                    under_min = 1 if assigned_paid_hours_week[e] < min_hours_map.get(e, 0) else 0
+
+                    candidates.append(
+                        (needs_night, under_min, -assigned_paid_hours_week[e], -len(days_worked_week[e]),
+                         e, s_str, e_str, paid_hours, lunch_pad, role, night_flag, stype)
+                    )
+
                 if not candidates:
                     assignments_this_week.append(
                         {
@@ -323,54 +407,148 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
                             "Date": dt.strftime("%Y-%m-%d"),
                             "Day": day_name,
                             "Employee": "UNFILLED",
+                            "EmployeeID": "",
                             "Start": "",
                             "End": "",
                             "Role": role,
+                            "ShiftType": stype,
+                            "PaidHours": 0.0,
+                            "ScheduledHours": 0.0,
+                            "Night": False,
                         }
                     )
                     continue
+
                 candidates.sort(reverse=True)
-                _, _, _, e, s_str, e_str, role = candidates[0]
+                _, _, _, _, e, s_str, e_str, paid_hours, lunch_pad, role, night_flag, stype = candidates[0]
+
                 assignments_this_week.append(
-                    {"Week": w_idx + 1, "Date": dt.strftime("%Y-%m-%d"), "Day": day_name, "Employee": e, "Start": s_str, "End": e_str, "Role": role}
+                    {
+                        "Week": w_idx + 1,
+                        "Date": dt.strftime("%Y-%m-%d"),
+                        "Day": day_name,
+                        "Employee": e,
+                        "EmployeeID": emp_id_map.get(e, ""),
+                        "Start": s_str,
+                        "End": e_str,
+                        "Role": role,
+                        "ShiftType": stype,
+                        "PaidHours": paid_hours,
+                        "ScheduledHours": paid_hours + lunch_pad,
+                        "Night": bool(night_flag),
+                    }
                 )
-                sh = hours_between(s_str, e_str)
-                assigned_hours_week[e] += sh
+                assigned_paid_hours_week[e] += paid_hours
                 days_worked_week[e].add(day_name)
+                if night_flag:
+                    nights_worked_week[e] += 1
 
         assignments_all.extend(assignments_this_week)
 
     out = pd.DataFrame(assignments_all)
 
-    # Hours column for summary
-    def _hours_col(r):
-        if not r["Start"] or not r["End"] or r["Employee"] in ("", "UNFILLED"):
-            return 0.0
-        return hours_between(r["Start"], r["End"])
+    # ------------ PREVIEW + CSV -------------
+    st.subheader("Week 1 Preview (on-screen)")
+    wk1 = out[out["Week"] == 1].copy()
+    if wk1.empty:
+        st.info("No assignments produced for Week 1. Check coverage/skills/availability.")
+    else:
+        emps = sorted([e for e in wk1["Employee"].dropna().unique() if e != "UNFILLED"])
+        mat = pd.DataFrame({"Employee": emps})
+        for d in DAYS:
+            mat[d] = ""
+        for _, r in wk1.iterrows():
+            e, d = r["Employee"], r["Day"]
+            if e == "UNFILLED":
+                continue
+            text = f"{fmt_time(r['Start'])} - {fmt_time(r['End'])} {r['Role']}"
+            ridx = mat.index[mat["Employee"] == e][0]
+            mat.at[ridx, d] = (mat.at[ridx, d] + "\n" if mat.at[ridx, d] else "") + text
+        st.dataframe(mat, use_container_width=True)
 
-    out["Hours"] = out.apply(_hours_col, axis=1)
-    hours_summary = out.groupby(["Week", "Employee"], dropna=False)["Hours"].sum().reset_index()
+    csv_bytes = out.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download assignments_detailed.csv",
+        data=csv_bytes,
+        file_name="assignments_detailed.csv",
+        mime="text/csv",
+    )
 
-    # Build weekly caps DF for merge
+    # ------------ Build Hours Summary (per week + total) -------------
+    hours_paid = out.groupby(["Week", "Employee"], dropna=False)["PaidHours"].sum().reset_index()
+    hours_sched = out.groupby(["Week", "Employee"], dropna=False)["ScheduledHours"].sum().reset_index().rename(
+        columns={"ScheduledHours": "ScheduledHoursSum"}
+    )
+    hours_summary = hours_paid.merge(hours_sched, on=["Week", "Employee"], how="left")
+
     caps_df = pd.DataFrame(
-        {"Employee": list(weekly_max_hours_map.keys()), "MaxHoursPerWeek_Configured": list(weekly_max_hours_map.values())}
+        {"Employee": list(weekly_max_paid_hours_map.keys()), "MaxHoursPerWeek_Configured": list(weekly_max_paid_hours_map.values())}
     )
     hours_summary = hours_summary.merge(caps_df, on="Employee", how="left")
 
-    # Pivot to Week columns 1..4
-    hours_pivot = hours_summary.pivot(index="Employee", columns="Week", values="Hours").fillna(0)
+    pivot_paid = hours_summary.pivot(index="Employee", columns="Week", values="PaidHours").fillna(0)
+    pivot_sched = hours_summary.pivot(index="Employee", columns="Week", values="ScheduledHoursSum").fillna(0)
     for wk in range(1, 5):
-        if wk not in hours_pivot.columns:
-            hours_pivot[wk] = 0.0
-    hours_pivot = (
-        hours_pivot[[1, 2, 3, 4]]
-        .reset_index()
-        .rename(columns={1: "Week1_Hours", 2: "Week2_Hours", 3: "Week3_Hours", 4: "Week4_Hours"})
-    )
-    total_summary = out.groupby(["Employee"], dropna=False)["Hours"].sum().reset_index().rename(columns={"Hours": "Hours_All_4_Weeks"})
-    hours_pivot = hours_pivot.merge(caps_df, on="Employee", how="left").merge(total_summary, on="Employee", how="left")
+        if wk not in pivot_paid.columns:
+            pivot_paid[wk] = 0.0
+        if wk not in pivot_sched.columns:
+            pivot_sched[wk] = 0.0
 
-    # Build Excel
+    hours_pivot = pd.DataFrame({"Employee": pivot_paid.index})
+    for wk in [1, 2, 3, 4]:
+        hours_pivot[f"Week{wk}_PaidHours"] = pivot_paid[wk].values
+    for wk in [1, 2, 3, 4]:
+        hours_pivot[f"Week{wk}_ScheduledHours"] = pivot_sched[wk].values
+
+    hours_pivot = hours_pivot.merge(caps_df, on="Employee", how="left")
+    hours_pivot["PaidHours_All_4_Weeks"] = hours_pivot[[f"Week{wk}_PaidHours" for wk in [1, 2, 3, 4]]].sum(axis=1)
+    hours_pivot["ScheduledHours_All_4_Weeks"] = hours_pivot[[f"Week{wk}_ScheduledHours" for wk in [1, 2, 3, 4]]].sum(axis=1)
+
+    # ------------ Build Paycom Import Template -------------
+    # Two lines per shift: In (ID) and Out (OD)
+    import_rows = []
+    for _, r in out.iterrows():
+        if r["Employee"] in ("", "UNFILLED"):
+            continue
+
+        empid = str(r.get("EmployeeID", "")).strip()
+
+        # Paycom date format: MM/DD/YYYY
+        date_dt = pd.to_datetime(r["Date"]).to_pydatetime()
+        date_str = date_dt.strftime("%m/%d/%Y")
+
+        start_4 = hhmm_to_4dig(str(r["Start"]))
+        end_4 = hhmm_to_4dig(str(r["End"]))
+        func = r["Role"]
+
+        # In punch
+        import_rows.append({
+            "A_EmployeeID": empid,
+            "B_Blank": "",
+            "C_Date": date_str,
+            "D_Time4": start_4,
+            "E_PunchType": "ID",
+            "F_Blank": "",
+            "G_Blank": "",
+            "H_Function": func,
+        })
+        # Out punch
+        import_rows.append({
+            "A_EmployeeID": empid,
+            "B_Blank": "",
+            "C_Date": date_str,
+            "D_Time4": end_4,
+            "E_PunchType": "OD",
+            "F_Blank": "",
+            "G_Blank": "",
+            "H_Function": func,
+        })
+
+    import_df = pd.DataFrame(import_rows, columns=[
+        "A_EmployeeID", "B_Blank", "C_Date", "D_Time4", "E_PunchType", "F_Blank", "G_Blank", "H_Function"
+    ])
+
+    # ------------ Excel Export -------------
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         workbook = writer.book
@@ -385,8 +563,8 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
             for role, color in role_colors.items()
         }
 
-        # Detailed tab first
-        out.drop(columns=["Hours"], errors="ignore").to_excel(writer, index=False, sheet_name="assignments_detailed")
+        # Detailed tab first (include EmployeeID)
+        out.to_excel(writer, index=False, sheet_name="assignments_detailed")
 
         for wk in range(1, 5):
             wkdf = out[out["Week"] == wk].copy()
@@ -409,17 +587,17 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
 
             role_map = {}
 
-            for _, r in wkdf.iterrows():
-                e = r["Employee"]
+            for _, rr in wkdf.iterrows():
+                e = rr["Employee"]
                 if e == "UNFILLED" or pd.isna(e):
                     continue
-                d = r["Day"]
-                text = f"{fmt_time(r['Start'])}-{fmt_time(r['End'])} {r['Role']}"
+                d = rr["Day"]
+                text = f"{fmt_time(rr['Start'])}-{fmt_time(rr['End'])} {rr['Role']}"
                 ridx = frame.index[frame["Employee"] == e][0]
                 existing = frame.at[ridx, d]
                 frame.at[ridx, d] = (existing + "\n" if existing else "") + text
                 if (ridx, d) not in role_map:
-                    role_map[(ridx, d)] = r["Role"]
+                    role_map[(ridx, d)] = rr["Role"]
 
             frame.to_excel(writer, index=False, sheet_name=sheetname, startrow=1)
             ws = writer.sheets[sheetname]
@@ -461,19 +639,25 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
         hours_pivot.to_excel(writer, index=False, sheet_name="hours_summary")
         ws_sum = writer.sheets["hours_summary"]
         ws_sum.set_column(0, 0, 26)
-        ws_sum.set_column(1, 6, 18)
+        ws_sum.set_column(1, 12, 18)
         for ci, col in enumerate(hours_pivot.columns):
             ws_sum.write(0, ci, str(col), header_fmt)
+
+        # Paycom Import Template tab (A..H)
+        import_df.to_excel(writer, index=False, sheet_name="import_template")
+        ws_imp = writer.sheets["import_template"]
+        ws_imp.set_column(0, 7, 18)
 
     output.seek(0)
     return output, out, hours_pivot
 
 
-# ------------------ Template Generator ------------------
+# ------------------ Template Generator (with EmployeeID & import_template) ------------------
 def generate_template_bytes():
     employees_df = pd.DataFrame(
         {
             "Employee": ["Example Person 1", "Example Person 2"],
+            "EmployeeID": ["10001", "10002"],  # new
             "MaxHoursPerWeek": [35, 30],
             "MinHours": [15, 12],
             "PreferredShiftHours": [8, 6],
@@ -504,7 +688,27 @@ def generate_template_bytes():
     ]
     coverage_df = pd.DataFrame(sample_cov)
     anchors_df = pd.DataFrame({"ShiftType": ["Open", "Mid", "Close"], "Anchor": ["Start", "Start", "End"], "Time": ["08:00", "10:00", "20:30"]})
-    rules_df = pd.DataFrame({"Rule": ["MinShiftHours", "MaxShiftHours", "MinGapBetweenShiftsHours", "MaxDaysPerWeek", "AllowSplitShifts"], "Value": [3, 10, 1, 6, "No"]})
+    rules_df = pd.DataFrame(
+        {
+            "Rule": [
+                "MinShiftHours",
+                "MaxShiftHours",
+                "MinGapBetweenShiftsHours",
+                "MaxDaysPerWeek",
+                "AllowSplitShifts",
+                "LunchTriggerHours",
+                "LunchMinutes",
+                "NightShiftTypes",
+                "NightShiftEndAtOrAfter",
+            ],
+            "Value": [3, 10, 1, 6, "No", 5, 30, "Close", ""],
+        }
+    )
+
+    # Empty import template tab with headers only
+    import_template_df = pd.DataFrame(columns=[
+        "A_EmployeeID", "B_Blank", "C_Date", "D_Time4", "E_PunchType", "F_Blank", "G_Blank", "H_Function"
+    ])
 
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
@@ -513,10 +717,12 @@ def generate_template_bytes():
         coverage_df.to_excel(writer, index=False, sheet_name="coverage_template")
         anchors_df.to_excel(writer, index=False, sheet_name="shift_anchors")
         rules_df.to_excel(writer, index=False, sheet_name="rules")
+        import_template_df.to_excel(writer, index=False, sheet_name="import_template")
 
         wb = writer.book
         ws_emp = writer.sheets["employees"]
         ws_avs = writer.sheets["availability_simple"]
+        ws_imp = writer.sheets["import_template"]
         yesno = ["Yes", "No"]
         # Add data validation dropdowns to role columns
         start_row = 1
@@ -542,6 +748,9 @@ def generate_template_bytes():
             ws_avs.data_validation(
                 first_row=start_row_av, first_col=col_idx, last_row=end_row_av, last_col=col_idx, options={"validate": "list", "source": yesno}
             )
+        # import_template formatting
+        ws_imp.set_column(0, 7, 18)
+
     bio.seek(0)
     return bio.read()
 
@@ -550,14 +759,14 @@ def generate_template_bytes():
 with st.sidebar:
     st.header("Template")
     st.download_button(
-        label="Download blank template (v4)",
+        label="Download blank template (v5)",
         data=generate_template_bytes(),
-        file_name="schedule_input_template_v4.xlsx",
+        file_name="schedule_input_template_v5.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     st.caption(
         "Template includes skills matrix (Yes/No), availability_simple (Yes = NOT available), rules Min=3 / Max=10, "
-        "and anchors (Open 08:00, Mid 10:00, Close 20:30). New: MaxHoursPerWeek column."
+        "anchors (Open 08:00, Mid 10:00, Close 20:30), EmployeeID, and an empty import_template tab."
     )
 
 uploaded = st.file_uploader("Upload your filled template (xlsx)", type=["xlsx"])
@@ -577,7 +786,7 @@ if st.button("Generate 4-week schedule", type="primary"):
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            st.subheader("Hours Summary (per week)")
+            st.subheader("Hours Summary (Paid vs Scheduled per week)")
             st.dataframe(hours_pivot, use_container_width=True)
         except Exception as e:
             st.exception(e)
