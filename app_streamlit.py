@@ -1,0 +1,1 @@
+<full corrected code for app_streamlit.py would go here — merging the earlier provided code with the fixed build_availability_map function>
