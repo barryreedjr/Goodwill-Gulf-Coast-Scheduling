@@ -1,4 +1,4 @@
-import streamlit as st
+   import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, date
 import io
@@ -7,8 +7,8 @@ st.set_page_config(page_title="Goodwill Scheduler", layout="wide")
 st.title("Goodwill Gulf Coast — Weekly Scheduler (weekly caps, lunch, night rotation, Paycom export)")
 st.caption(
     "Upload the input Excel, choose an optional start date, and download a 4-week schedule. "
-    "Weekly max hours are enforced per week, long shifts add lunch automatically, "
-    "night shifts are spread (priority), and a Paycom import template is generated."
+    "Weekly max hours are enforced per week, long shifts add lunch automatically (>5 paid hours), "
+    "night shifts are spread (>=1 per employee per week, when possible), and a Paycom import template is generated."
 )
 
 DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
@@ -47,21 +47,32 @@ def get_numeric_series(df: pd.DataFrame, col: str, default_val, length: int) -> 
 def load_inputs(file):
     xls = pd.ExcelFile(file)
     employees = pd.read_excel(xls, "employees").fillna("")
+
+    # availability_simple optional
     availability_simple = (
         pd.read_excel(xls, "availability_simple").fillna("")
         if "availability_simple" in xls.sheet_names
         else None
     )
+    # availability optional (detailed windows)
     availability = (
         pd.read_excel(xls, "availability").fillna("")
         if "availability" in xls.sheet_names
         else None
     )
-    coverage = pd.read_excel(xls, "coverage_template").fillna("")
+
+    # coverage can be "coverage" (new) or "coverage_template" (older)
+    coverage_sheet = "coverage" if "coverage" in xls.sheet_names else "coverage_template"
+    coverage = pd.read_excel(xls, coverage_sheet).fillna("")
+
     anchors = pd.read_excel(xls, "shift_anchors").fillna("")
     rules = pd.read_excel(xls, "rules").fillna("")
+
     if "Day" in coverage.columns:
         coverage["Day"] = coverage["Day"].astype(str).str.strip().str.title()
+    if "ShiftType" in coverage.columns:
+        coverage["ShiftType"] = coverage["ShiftType"].astype(str).str.strip().str.title()
+
     return employees, availability, availability_simple, coverage, anchors, rules
 
 
@@ -73,7 +84,7 @@ def build_availability_map(employees, availability, availability_simple):
     """
     avail = {}
 
-    # Simple Yes/No per day: Yes = NOT available (per the template's caption)
+    # Simple Yes/No per day: Yes = NOT available
     if availability_simple is not None and not availability_simple.empty:
         df = availability_simple.copy()
         df.columns = [("Employee" if c == "Employee" else str(c).strip().title()) for c in df.columns]
@@ -82,10 +93,8 @@ def build_availability_map(employees, availability, availability_simple):
             for d in DAYS:
                 resp = str(row.get(d, "")).strip().lower()
                 if resp in ("yes", "y", "true", "1", "x"):
-                    # not available that day
                     avail.setdefault(emp, {}).setdefault(d, [])
                 else:
-                    # available all day window
                     avail.setdefault(emp, {}).setdefault(d, []).append(("08:00", "20:30"))
         return avail
 
@@ -505,43 +514,28 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
     hours_pivot["ScheduledHours_All_4_Weeks"] = hours_pivot[[f"Week{wk}_ScheduledHours" for wk in [1, 2, 3, 4]]].sum(axis=1)
 
     # ------------ Build Paycom Import Template -------------
-    # Two lines per shift: In (ID) and Out (OD)
+    # Two lines per shift: In (ID) and Out (OD); Paycom date MM/DD/YYYY
     import_rows = []
     for _, r in out.iterrows():
         if r["Employee"] in ("", "UNFILLED"):
             continue
 
         empid = str(r.get("EmployeeID", "")).strip()
-
-        # Paycom date format: MM/DD/YYYY
         date_dt = pd.to_datetime(r["Date"]).to_pydatetime()
         date_str = date_dt.strftime("%m/%d/%Y")
-
         start_4 = hhmm_to_4dig(str(r["Start"]))
         end_4 = hhmm_to_4dig(str(r["End"]))
         func = r["Role"]
 
         # In punch
         import_rows.append({
-            "A_EmployeeID": empid,
-            "B_Blank": "",
-            "C_Date": date_str,
-            "D_Time4": start_4,
-            "E_PunchType": "ID",
-            "F_Blank": "",
-            "G_Blank": "",
-            "H_Function": func,
+            "A_EmployeeID": empid, "B_Blank": "", "C_Date": date_str, "D_Time4": start_4,
+            "E_PunchType": "ID", "F_Blank": "", "G_Blank": "", "H_Function": func
         })
         # Out punch
         import_rows.append({
-            "A_EmployeeID": empid,
-            "B_Blank": "",
-            "C_Date": date_str,
-            "D_Time4": end_4,
-            "E_PunchType": "OD",
-            "F_Blank": "",
-            "G_Blank": "",
-            "H_Function": func,
+            "A_EmployeeID": empid, "B_Blank": "", "C_Date": date_str, "D_Time4": end_4,
+            "E_PunchType": "OD", "F_Blank": "", "G_Blank": "", "H_Function": func
         })
 
     import_df = pd.DataFrame(import_rows, columns=[
@@ -652,60 +646,153 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
     return output, out, hours_pivot
 
 
-# ------------------ Template Generator (with EmployeeID & import_template) ------------------
+# ------------------ Template Generator (LOCKED coverage; EmployeeID next to Employee) ------------------
 def generate_template_bytes():
+    # Employees: headers only (IDs blank for managers to fill)
     employees_df = pd.DataFrame(
         {
-            "Employee": ["Example Person 1", "Example Person 2"],
-            "EmployeeID": ["10001", "10002"],  # new
-            "MaxHoursPerWeek": [35, 30],
-            "MinHours": [15, 12],
-            "PreferredShiftHours": [8, 6],
-            "Cashier": ["Yes", "No"],
-            "Donation": ["No", "Yes"],
-            "Pricer": ["No", "Yes"],
-            "Hanger": ["No", "No"],
-            "Manager": ["Yes", "No"],
-        }
-    )
-    availability_simple_df = pd.DataFrame(
-        {
-            "Employee": employees_df["Employee"],
-            "Sunday": ["No", "No"],
-            "Monday": ["No", "No"],
-            "Tuesday": ["No", "No"],
-            "Wednesday": ["No", "No"],
-            "Thursday": ["No", "No"],
-            "Friday": ["No", "No"],
-            "Saturday": ["No", "No"],
-        }
-    )
-    sample_cov = [
-        {"Role": "Cashier", "Day": "Sunday", "ShiftType": "Open", "Count": 1},
-        {"Role": "Donation", "Day": "Sunday", "ShiftType": "Open", "Count": 1},
-        {"Role": "Cashier", "Day": "Saturday", "ShiftType": "Mid", "Count": 2},
-        {"Role": "Donation", "Day": "Saturday", "ShiftType": "Mid", "Count": 2},
-    ]
-    coverage_df = pd.DataFrame(sample_cov)
-    anchors_df = pd.DataFrame({"ShiftType": ["Open", "Mid", "Close"], "Anchor": ["Start", "Start", "End"], "Time": ["08:00", "10:00", "20:30"]})
-    rules_df = pd.DataFrame(
-        {
-            "Rule": [
-                "MinShiftHours",
-                "MaxShiftHours",
-                "MinGapBetweenShiftsHours",
-                "MaxDaysPerWeek",
-                "AllowSplitShifts",
-                "LunchTriggerHours",
-                "LunchMinutes",
-                "NightShiftTypes",
-                "NightShiftEndAtOrAfter",
-            ],
-            "Value": [3, 10, 1, 6, "No", 5, 30, "Close", ""],
+            "Employee": [],
+            "EmployeeID": [],
+            "MaxHoursPerWeek": [],
+            "MinHours": [],
+            "PreferredShiftHours": [],
+            "Cashier": [],
+            "Donation": [],
+            "Pricer": [],
+            "Hanger": [],
+            "Manager": [],
         }
     )
 
-    # Empty import template tab with headers only
+    availability_simple_df = pd.DataFrame(
+        {
+            "Employee": [],
+            "Sunday": [],
+            "Monday": [],
+            "Tuesday": [],
+            "Wednesday": [],
+            "Thursday": [],
+            "Friday": [],
+            "Saturday": [],
+        }
+    )
+
+    # LOCKED weekly coverage you provided (Role, Day, ShiftType, Count)
+    coverage_rows = [
+        # Cashier
+        {"Role":"Cashier","Day":"Friday","ShiftType":"Close","Count":1},
+        {"Role":"Cashier","Day":"Friday","ShiftType":"Mid","Count":1},
+        {"Role":"Cashier","Day":"Friday","ShiftType":"Open","Count":1},
+        {"Role":"Cashier","Day":"Monday","ShiftType":"Close","Count":1},
+        {"Role":"Cashier","Day":"Monday","ShiftType":"Mid","Count":1},
+        {"Role":"Cashier","Day":"Monday","ShiftType":"Open","Count":1},
+        {"Role":"Cashier","Day":"Saturday","ShiftType":"Close","Count":1},
+        {"Role":"Cashier","Day":"Saturday","ShiftType":"Mid","Count":2},
+        {"Role":"Cashier","Day":"Saturday","ShiftType":"Open","Count":1},
+        {"Role":"Cashier","Day":"Sunday","ShiftType":"Close","Count":1},
+        {"Role":"Cashier","Day":"Sunday","ShiftType":"Open","Count":1},
+        {"Role":"Cashier","Day":"Thursday","ShiftType":"Close","Count":1},
+        {"Role":"Cashier","Day":"Thursday","ShiftType":"Mid","Count":1},
+        {"Role":"Cashier","Day":"Thursday","ShiftType":"Open","Count":1},
+        {"Role":"Cashier","Day":"Tuesday","ShiftType":"Close","Count":1},
+        {"Role":"Cashier","Day":"Tuesday","ShiftType":"Mid","Count":1},
+        {"Role":"Cashier","Day":"Tuesday","ShiftType":"Open","Count":1},
+        {"Role":"Cashier","Day":"Wednesday","ShiftType":"Close","Count":1},
+        {"Role":"Cashier","Day":"Wednesday","ShiftType":"Mid","Count":1},
+        {"Role":"Cashier","Day":"Wednesday","ShiftType":"Open","Count":1},
+        # Donation
+        {"Role":"Donation","Day":"Friday","ShiftType":"Close","Count":1},
+        {"Role":"Donation","Day":"Friday","ShiftType":"Mid","Count":1},
+        {"Role":"Donation","Day":"Friday","ShiftType":"Open","Count":1},
+        {"Role":"Donation","Day":"Monday","ShiftType":"Close","Count":1},
+        {"Role":"Donation","Day":"Monday","ShiftType":"Mid","Count":1},
+        {"Role":"Donation","Day":"Monday","ShiftType":"Open","Count":1},
+        {"Role":"Donation","Day":"Saturday","ShiftType":"Close","Count":1},
+        {"Role":"Donation","Day":"Saturday","ShiftType":"Mid","Count":2},
+        {"Role":"Donation","Day":"Saturday","ShiftType":"Open","Count":1},
+        {"Role":"Donation","Day":"Sunday","ShiftType":"Close","Count":1},
+        {"Role":"Donation","Day":"Sunday","ShiftType":"Mid","Count":1},
+        {"Role":"Donation","Day":"Sunday","ShiftType":"Open","Count":1},
+        {"Role":"Donation","Day":"Thursday","ShiftType":"Close","Count":1},
+        {"Role":"Donation","Day":"Thursday","ShiftType":"Mid","Count":1},
+        {"Role":"Donation","Day":"Thursday","ShiftType":"Open","Count":1},
+        {"Role":"Donation","Day":"Tuesday","ShiftType":"Close","Count":1},
+        {"Role":"Donation","Day":"Tuesday","ShiftType":"Mid","Count":1},
+        {"Role":"Donation","Day":"Tuesday","ShiftType":"Open","Count":1},
+        {"Role":"Donation","Day":"Wednesday","ShiftType":"Close","Count":1},
+        {"Role":"Donation","Day":"Wednesday","ShiftType":"Mid","Count":1},
+        {"Role":"Donation","Day":"Wednesday","ShiftType":"Open","Count":1},
+        # Hanger
+        {"Role":"Hanger","Day":"Friday","ShiftType":"Close","Count":1},
+        {"Role":"Hanger","Day":"Friday","ShiftType":"Mid","Count":1},
+        {"Role":"Hanger","Day":"Friday","ShiftType":"Open","Count":2},
+        {"Role":"Hanger","Day":"Monday","ShiftType":"Close","Count":1},
+        {"Role":"Hanger","Day":"Monday","ShiftType":"Mid","Count":1},
+        {"Role":"Hanger","Day":"Monday","ShiftType":"Open","Count":2},
+        {"Role":"Hanger","Day":"Saturday","ShiftType":"Close","Count":1},
+        {"Role":"Hanger","Day":"Saturday","ShiftType":"Mid","Count":1},
+        {"Role":"Hanger","Day":"Saturday","ShiftType":"Open","Count":2},
+        {"Role":"Hanger","Day":"Sunday","ShiftType":"Close","Count":1},
+        {"Role":"Hanger","Day":"Sunday","ShiftType":"Mid","Count":1},
+        {"Role":"Hanger","Day":"Sunday","ShiftType":"Open","Count":2},
+        {"Role":"Hanger","Day":"Thursday","ShiftType":"Close","Count":1},
+        {"Role":"Hanger","Day":"Thursday","ShiftType":"Mid","Count":1},
+        {"Role":"Hanger","Day":"Thursday","ShiftType":"Open","Count":2},
+        {"Role":"Hanger","Day":"Tuesday","ShiftType":"Close","Count":1},
+        {"Role":"Hanger","Day":"Tuesday","ShiftType":"Mid","Count":1},
+        {"Role":"Hanger","Day":"Tuesday","ShiftType":"Open","Count":2},
+        {"Role":"Hanger","Day":"Wednesday","ShiftType":"Close","Count":1},
+        {"Role":"Hanger","Day":"Wednesday","ShiftType":"Mid","Count":1},
+        {"Role":"Hanger","Day":"Wednesday","ShiftType":"Open","Count":2},
+        # Manager
+        {"Role":"Manager","Day":"Friday","ShiftType":"Close","Count":1},
+        {"Role":"Manager","Day":"Friday","ShiftType":"Open","Count":1},
+        {"Role":"Manager","Day":"Monday","ShiftType":"Close","Count":1},
+        {"Role":"Manager","Day":"Monday","ShiftType":"Open","Count":1},
+        {"Role":"Manager","Day":"Saturday","ShiftType":"Close","Count":1},
+        {"Role":"Manager","Day":"Saturday","ShiftType":"Open","Count":1},
+        {"Role":"Manager","Day":"Sunday","ShiftType":"Close","Count":1},
+        {"Role":"Manager","Day":"Sunday","ShiftType":"Open","Count":1},
+        {"Role":"Manager","Day":"Thursday","ShiftType":"Close","Count":1},
+        {"Role":"Manager","Day":"Thursday","ShiftType":"Open","Count":1},
+        {"Role":"Manager","Day":"Tuesday","ShiftType":"Close","Count":1},
+        {"Role":"Manager","Day":"Tuesday","ShiftType":"Open","Count":1},
+        {"Role":"Manager","Day":"Wednesday","ShiftType":"Close","Count":1},
+        {"Role":"Manager","Day":"Wednesday","ShiftType":"Open","Count":1},
+        # Pricer
+        {"Role":"Pricer","Day":"Friday","ShiftType":"Close","Count":2},
+        {"Role":"Pricer","Day":"Friday","ShiftType":"Open","Count":2},
+        {"Role":"Pricer","Day":"Monday","ShiftType":"Close","Count":2},
+        {"Role":"Pricer","Day":"Monday","ShiftType":"Open","Count":2},
+        {"Role":"Pricer","Day":"Saturday","ShiftType":"Close","Count":2},
+        {"Role":"Pricer","Day":"Saturday","ShiftType":"Open","Count":2},
+        {"Role":"Pricer","Day":"Sunday","ShiftType":"Close","Count":1},
+        {"Role":"Pricer","Day":"Sunday","ShiftType":"Open","Count":2},
+        {"Role":"Pricer","Day":"Thursday","ShiftType":"Close","Count":2},
+        {"Role":"Pricer","Day":"Thursday","ShiftType":"Open","Count":2},
+        {"Role":"Pricer","Day":"Tuesday","ShiftType":"Close","Count":2},
+        {"Role":"Pricer","Day":"Tuesday","ShiftType":"Open","Count":2},
+        {"Role":"Pricer","Day":"Wednesday","ShiftType":"Close","Count":2},
+        {"Role":"Pricer","Day":"Wednesday","ShiftType":"Open","Count":2},
+    ]
+    coverage_df = pd.DataFrame(coverage_rows)[["Role", "Day", "ShiftType", "Count"]]
+
+    anchors_df = pd.DataFrame({
+        "ShiftType": ["Open", "Mid", "Close"],
+        "Anchor": ["Start", "Start", "End"],
+        "Time": ["08:00", "10:00", "20:30"]
+    })
+
+    rules_df = pd.DataFrame({
+        "Rule": [
+            "MinShiftHours", "MaxShiftHours", "MinGapBetweenShiftsHours", "MaxDaysPerWeek",
+            "AllowSplitShifts", "LunchTriggerHours", "LunchMinutes",
+            "NightShiftTypes", "NightShiftEndAtOrAfter"
+        ],
+        "Value": [3, 10, 1, 6, "No", 5, 30, "Close", ""]
+    })
+
+    # Empty import template tab with headers only (Paycom)
     import_template_df = pd.DataFrame(columns=[
         "A_EmployeeID", "B_Blank", "C_Date", "D_Time4", "E_PunchType", "F_Blank", "G_Blank", "H_Function"
     ])
@@ -714,7 +801,8 @@ def generate_template_bytes():
     with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         employees_df.to_excel(writer, index=False, sheet_name="employees")
         availability_simple_df.to_excel(writer, index=False, sheet_name="availability_simple")
-        coverage_df.to_excel(writer, index=False, sheet_name="coverage_template")
+        # LOCKED coverage on a sheet named 'coverage'
+        coverage_df.to_excel(writer, index=False, sheet_name="coverage")
         anchors_df.to_excel(writer, index=False, sheet_name="shift_anchors")
         rules_df.to_excel(writer, index=False, sheet_name="rules")
         import_template_df.to_excel(writer, index=False, sheet_name="import_template")
@@ -722,33 +810,39 @@ def generate_template_bytes():
         wb = writer.book
         ws_emp = writer.sheets["employees"]
         ws_avs = writer.sheets["availability_simple"]
+        ws_cov = writer.sheets["coverage"]
         ws_imp = writer.sheets["import_template"]
         yesno = ["Yes", "No"]
+
         # Add data validation dropdowns to role columns
         start_row = 1
         end_row = start_row + 300
         for role in ["Cashier", "Donation", "Pricer", "Hanger", "Manager"]:
-            idx = employees_df.columns.get_loc(role)
-            ws_emp.data_validation(
-                first_row=start_row, first_col=idx, last_row=end_row, last_col=idx, options={"validate": "list", "source": yesno}
-            )
-        # PreferredShiftHours numeric min/max
-        pref_idx = employees_df.columns.get_loc("PreferredShiftHours")
-        ws_emp.data_validation(
-            first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx, options={"validate": "integer", "criteria": ">=", "value": 3}
-        )
-        ws_emp.data_validation(
-            first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx, options={"validate": "integer", "criteria": "<=", "value": 10}
-        )
+            idx = list(employees_df.columns).index(role) if role in employees_df.columns else None
+            if idx is not None:
+                ws_emp.data_validation(first_row=start_row, first_col=idx, last_row=end_row, last_col=idx,
+                                       options={"validate": "list", "source": yesno})
+
+        # PreferredShiftHours numeric min/max if present
+        if "PreferredShiftHours" in employees_df.columns:
+            pref_idx = list(employees_df.columns).index("PreferredShiftHours")
+            ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
+                                   options={"validate":"integer","criteria":">=","value":3})
+            ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
+                                   options={"validate":"integer","criteria":"<=","value":10})
+
         # availability_simple dropdowns
         start_row_av = 1
         end_row_av = start_row_av + 600
         for d in DAYS:
-            col_idx = availability_simple_df.columns.get_loc(d)
-            ws_avs.data_validation(
-                first_row=start_row_av, first_col=col_idx, last_row=end_row_av, last_col=col_idx, options={"validate": "list", "source": yesno}
-            )
-        # import_template formatting
+            if d in availability_simple_df.columns:
+                col_idx = list(availability_simple_df.columns).index(d)
+                ws_avs.data_validation(first_row=start_row_av, first_col=col_idx, last_row=end_row_av, last_col=col_idx,
+                                       options={"validate":"list","source":yesno})
+
+        # widen columns for readability
+        ws_emp.set_column(0, len(employees_df.columns)-1, 18)
+        ws_cov.set_column(0, 3, 16)
         ws_imp.set_column(0, 7, 18)
 
     bio.seek(0)
@@ -759,14 +853,14 @@ def generate_template_bytes():
 with st.sidebar:
     st.header("Template")
     st.download_button(
-        label="Download blank template (v5)",
+        label="Download blank template (LOCKED coverage)",
         data=generate_template_bytes(),
-        file_name="schedule_input_template_v5.xlsx",
+        file_name="schedule_input_template_v_locked_coverage.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     st.caption(
-        "Template includes skills matrix (Yes/No), availability_simple (Yes = NOT available), rules Min=3 / Max=10, "
-        "anchors (Open 08:00, Mid 10:00, Close 20:30), EmployeeID, and an empty import_template tab."
+        "Template includes: employees (Employee + EmployeeID), availability_simple (optional), "
+        "coverage (pre-filled Role/Day/ShiftType/Count you provided), shift_anchors, rules, and an empty import_template."
     )
 
 uploaded = st.file_uploader("Upload your filled template (xlsx)", type=["xlsx"])
