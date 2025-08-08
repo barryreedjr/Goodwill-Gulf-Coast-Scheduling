@@ -1,4 +1,4 @@
-   import streamlit as st
+import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, date
 import io
@@ -677,7 +677,7 @@ def generate_template_bytes():
         }
     )
 
-    # LOCKED weekly coverage you provided (Role, Day, ShiftType, Count)
+    # LOCKED weekly coverage (Role, Day, ShiftType, Count)
     coverage_rows = [
         # Cashier
         {"Role":"Cashier","Day":"Friday","ShiftType":"Close","Count":1},
@@ -814,12 +814,12 @@ def generate_template_bytes():
         ws_imp = writer.sheets["import_template"]
         yesno = ["Yes", "No"]
 
-        # Add data validation dropdowns to role columns
+        # Add data validation dropdowns to role columns (if managers add rows)
         start_row = 1
         end_row = start_row + 300
         for role in ["Cashier", "Donation", "Pricer", "Hanger", "Manager"]:
-            idx = list(employees_df.columns).index(role) if role in employees_df.columns else None
-            if idx is not None:
+            if role in employees_df.columns:
+                idx = list(employees_df.columns).index(role)
                 ws_emp.data_validation(first_row=start_row, first_col=idx, last_row=end_row, last_col=idx,
                                        options={"validate": "list", "source": yesno})
 
@@ -884,3 +884,4 @@ if st.button("Generate 4-week schedule", type="primary"):
             st.dataframe(hours_pivot, use_container_width=True)
         except Exception as e:
             st.exception(e)
+  
