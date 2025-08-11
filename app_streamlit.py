@@ -853,7 +853,7 @@ def generate_template_bytes():
             ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
                                    options={"validate":"integer","criteria":">=","value":3})
             ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
-                                   options({"validate":"integer","criteria":"<=","value":10}))
+                                   options({"validate":"integer","criteria":"<=","value": 10})
 
         # availability_simple dropdowns
         start_row_av = 1
