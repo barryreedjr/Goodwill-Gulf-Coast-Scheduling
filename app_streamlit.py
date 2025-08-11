@@ -104,7 +104,7 @@ def build_availability_map(employees, availability, availability_simple):
     # Simple Yes/No per day: Yes = NOT available
     if availability_simple is not None and not availability_simple.empty:
         df = availability_simple.copy()
-        df.columns = [("Employee" if c == "Employee" else str(c).strip().title()) for c in df.columns]
+        df.columns = [("Employee" if c == "Employee" else str(c).strip().str.title()) for c in df.columns]
         for _, row in df.iterrows():
             emp = row["Employee"]
             for d in DAYS:
@@ -661,9 +661,16 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
         for ci, col in enumerate(hours_pivot.columns):
             ws_sum.write(0, ci, str(col), header_fmt)
 
-        # Paycom Import Template tab (A..H)
+        # Paycom Import Template tab (A..H) — ensure D (time) is text and contains HH:MM
+        # Re-normalize to be safe (in case any upstream change slipped through)
+        if not import_df.empty:
+            import_df["D_Time4"] = import_df["D_Time4"].astype(str).apply(to_hh_colon)
+
         import_df.to_excel(writer, index=False, sheet_name="import_template")
         ws_imp = writer.sheets["import_template"]
+        # Force column D to text format so Excel preserves "08:00"
+        time_text_fmt = workbook.add_format({'num_format': '@'})
+        ws_imp.set_column(3, 3, 8, time_text_fmt)  # D column only
         ws_imp.set_column(0, 7, 18)
 
     output.seek(0)
@@ -851,9 +858,9 @@ def generate_template_bytes():
         if "PreferredShiftHours" in employees_df.columns:
             pref_idx = list(employees_df.columns).index("PreferredShiftHours")
             ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
-                                   options={"validate":"integer","criteria":">=","value":3})
+                                   options={"validate": "integer", "criteria": ">=", "value": 3})
             ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
-                                   options({"validate":"integer","criteria":"<=","value": 10})
+                                   options={"validate": "integer", "criteria": "<=", "value": 10})
 
         # availability_simple dropdowns
         start_row_av = 1
@@ -862,7 +869,7 @@ def generate_template_bytes():
             if d in availability_simple_df.columns:
                 col_idx = list(availability_simple_df.columns).index(d)
                 ws_avs.data_validation(first_row=start_row_av, first_col=col_idx, last_row=end_row_av, last_col=col_idx,
-                                       options={"validate":"list","source":yesno})
+                                       options={"validate": "list", "source": yesno})
 
         # widen columns for readability
         ws_emp.set_column(0, len(employees_df.columns)-1, 18)
