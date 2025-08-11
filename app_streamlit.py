@@ -104,7 +104,11 @@ def build_availability_map(employees, availability, availability_simple):
     # Simple Yes/No per day: Yes = NOT available
     if availability_simple is not None and not availability_simple.empty:
         df = availability_simple.copy()
-        df.columns = [("Employee" if c == "Employee" else str(c).strip().str.title()) for c in df.columns]
+        df.columns = [
+    ("Employee" if str(c).strip().lower() == "employee" else str(c).strip().title())
+    for c in df.columns
+]
+
         for _, row in df.iterrows():
             emp = row["Employee"]
             for d in DAYS:
