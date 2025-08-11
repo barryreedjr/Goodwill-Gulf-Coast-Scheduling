@@ -29,13 +29,30 @@ def fmt_time(hhmm: str) -> str:
         return hhmm
 
 def hhmm_to_4dig(hhmm: str) -> str:
-    # "HH:MM" -> "HHMM" (always 4 digits)
+    # legacy helper (kept for compatibility)
     try:
         t = datetime.strptime(hhmm, "%H:%M")
         return t.strftime("%H%M")
     except Exception:
-        # best effort fallback
         return hhmm.replace(":", "")[:4].rjust(4, "0")
+
+def to_hh_colon(hhmm_like: str) -> str:
+    """
+    Normalize to HH:MM (24h). Accepts '8:00', '08:00', '800', '0800'.
+    Returns original if it can't parse.
+    """
+    s = str(hhmm_like).strip()
+    # Already HH:MM?
+    try:
+        return datetime.strptime(s, "%H:%M").strftime("%H:%M")
+    except Exception:
+        pass
+    # 3-4 digit military -> add colon
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) in (3, 4):
+        digits = digits.rjust(4, "0")
+        return f"{digits[:2]}:{digits[2:]}"
+    return s  # fallback
 
 def get_numeric_series(df: pd.DataFrame, col: str, default_val, length: int) -> pd.Series:
     if col in df.columns:
@@ -269,6 +286,8 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
     # Night shift config
     night_types = set([s.strip() for s in str(rules.get("NightShiftTypes", "Close")).split(",") if s.strip()])
     night_end_threshold = str(rules.get("NightShiftEndAtOrAfter", "")).strip() or None
+    # Full-time threshold (default 40)
+    rules["FullTimeThresholdHours"] = float(rules.get("FullTimeThresholdHours", 40))
 
     anchors_map = {r["ShiftType"]: {"Anchor": r["Anchor"], "Time": r["Time"]} for _, r in anchors.iterrows()}
 
@@ -280,6 +299,10 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
         len(employees),
     )
     weekly_max_paid_hours_map = dict(zip(employees["Employee"], weekly_max_series))
+
+    # Identify full-time (MaxHoursPerWeek >= threshold)
+    full_time_cutoff = float(rules["FullTimeThresholdHours"])
+    is_full_time = {e: (weekly_max_paid_hours_map.get(e, 0) >= full_time_cutoff) for e in employees["Employee"]}
 
     # Employee ID map (supports 'EmployeeID' or 'Employee ID')
     emp_id_col = None
@@ -354,7 +377,7 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
                 count = sum(1 for e in employees["Employee"] if role in funcs_map.get(e, set()))
                 rarity[role] = 1.0 / (count if count > 0 else 0.5)
 
-            # ---- NEW: sort by shift priority first (Open -> Close -> Mid), then by role rarity ----
+            # Sort by shift priority first (Open -> Close -> Mid), then by role rarity
             demands.sort(key=lambda d: (get_shift_priority(d["ShiftType"]), -rarity.get(d["Role"], 1.0)))
 
             for dem in demands:
@@ -393,13 +416,19 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
 
                     night_flag = is_night_shift(stype, e_str, night_types, night_end_threshold)
 
-                    # ---- NEW: ranking to drive toward weekly max ----
+                    # --- Priority weights ---
+                    # 1) Full-time who are still under the FT threshold (e.g., < 40 hours) come first
+                    ft_need = 1 if (is_full_time[e] and assigned_paid_hours_week[e] < min(full_time_cutoff, weekly_max_paid_hours_map.get(e, 0))) else 0
+                    # 2) Ensure each employee gets >=1 night per week when possible
                     needs_night = 1 if (night_flag and nights_worked_week[e] == 0) else 0
+                    # 3) Under personal minimums
                     under_min = 1 if assigned_paid_hours_week[e] < min_hours_map.get(e, 0) else 0
+                    # 4) Remaining capacity to weekly max
                     remaining_cap = weekly_max_paid_hours_map.get(e, float("inf")) - assigned_paid_hours_week.get(e, 0)
 
+                    # Sort keys (higher is better when we reverse=True)
                     candidates.append(
-                        (needs_night, under_min, remaining_cap, -assigned_paid_hours_week[e], -len(days_worked_week[e]),
+                        (ft_need, needs_night, under_min, remaining_cap, -assigned_paid_hours_week[e], -len(days_worked_week[e]),
                          e, s_str, e_str, paid_hours, lunch_pad, role, night_flag, stype)
                     )
 
@@ -423,7 +452,7 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
                     continue
 
                 candidates.sort(reverse=True)
-                _, _, _, _, _, e, s_str, e_str, paid_hours, lunch_pad, role, night_flag, stype = candidates[0]
+                _, _, _, _, _, _, e, s_str, e_str, paid_hours, lunch_pad, role, night_flag, stype = candidates[0]
 
                 assignments_this_week.append(
                     {
@@ -517,18 +546,19 @@ def run_schedule_with_summary(file, startdate_str=None, role_colors=None):
         empid = str(r.get("EmployeeID", "")).strip()
         date_dt = pd.to_datetime(r["Date"]).to_pydatetime()
         date_str = date_dt.strftime("%m/%d/%Y")
-        start_4 = hhmm_to_4dig(str(r["Start"]))
-        end_4 = hhmm_to_4dig(str(r["End"]))
+        # Ensure HH:MM format for Paycom
+        start_hhmm = to_hh_colon(str(r["Start"]))
+        end_hhmm   = to_hh_colon(str(r["End"]))
         func = r["Role"]
 
         # In punch
         import_rows.append({
-            "A_EmployeeID": empid, "B_Blank": "", "C_Date": date_str, "D_Time4": start_4,
+            "A_EmployeeID": empid, "B_Blank": "", "C_Date": date_str, "D_Time4": start_hhmm,
             "E_PunchType": "ID", "F_Blank": "", "G_Blank": "", "H_Function": func
         })
         # Out punch
         import_rows.append({
-            "A_EmployeeID": empid, "B_Blank": "", "C_Date": date_str, "D_Time4": end_4,
+            "A_EmployeeID": empid, "B_Blank": "", "C_Date": date_str, "D_Time4": end_hhmm,
             "E_PunchType": "OD", "F_Blank": "", "G_Blank": "", "H_Function": func
         })
 
@@ -781,9 +811,9 @@ def generate_template_bytes():
         "Rule": [
             "MinShiftHours", "MaxShiftHours", "MinGapBetweenShiftsHours", "MaxDaysPerWeek",
             "AllowSplitShifts", "LunchTriggerHours", "LunchMinutes",
-            "NightShiftTypes", "NightShiftEndAtOrAfter"
+            "NightShiftTypes", "NightShiftEndAtOrAfter", "FullTimeThresholdHours"
         ],
-        "Value": [3, 10, 1, 6, "No", 5, 30, "Close", ""]
+        "Value": [3, 10, 1, 6, "No", 5, 30, "Close", "", 40]
     })
 
     # Empty import template tab with headers only (Paycom)
@@ -823,7 +853,7 @@ def generate_template_bytes():
             ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
                                    options={"validate":"integer","criteria":">=","value":3})
             ws_emp.data_validation(first_row=start_row, first_col=pref_idx, last_row=end_row, last_col=pref_idx,
-                                   options={"validate":"integer","criteria":"<=","value":10})
+                                   options({"validate":"integer","criteria":"<=","value":10}))
 
         # availability_simple dropdowns
         start_row_av = 1
